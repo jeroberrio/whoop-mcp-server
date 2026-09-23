@@ -373,6 +373,13 @@ async function main(): Promise<void> {
 		app.use(express.json());
 		app.use(express.urlencoded({ extended: true }));
 
+		// Lightweight request logging so OAuth/MCP handshake issues are visible
+		// in Railway logs instead of silently failing.
+		app.use((req: Request, _res: Response, next: () => void) => {
+			process.stdout.write(`[req] ${req.method} ${req.path} sid=${req.headers['mcp-session-id'] ?? '-'}\n`);
+			next();
+		});
+
 		// ── OAuth Authorization Server Discovery (RFC 8414) ──────────────────────
 		app.get('/.well-known/oauth-authorization-server', (req: Request, res: Response) => {
 			const baseUrl = `${req.protocol}://${req.headers.host}`;
@@ -445,6 +452,7 @@ async function main(): Promise<void> {
 
 			const tokenData = oauthCodes.get(code);
 			if (!tokenData) {
+				process.stderr.write(`[/token] invalid_grant: code not found (already used, expired, or wrong code): ${code}\n`);
 				res.status(400).json({ error: 'invalid_grant', error_description: 'Invalid or expired authorization code' });
 				return;
 			}
@@ -500,6 +508,7 @@ async function main(): Promise<void> {
 				}
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
+				process.stderr.write(`[/callback] Authorization failed: ${message}\n`);
 				res.status(500).send(`Authorization failed: ${message}`);
 			}
 		});
@@ -511,38 +520,62 @@ async function main(): Promise<void> {
 		app.all('/mcp', async (req: Request, res: Response) => {
 			const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
-			if (req.method === 'DELETE' && sessionId && transports.has(sessionId)) {
-				const session = transports.get(sessionId)!;
-				await session.transport.close();
-				transports.delete(sessionId);
-				res.status(200).send('Session closed');
-				return;
-			}
-
-			if (req.method === 'POST') {
-				let transport: StreamableHTTPServerTransport;
-
-				if (sessionId && transports.has(sessionId)) {
+			try {
+				if (req.method === 'DELETE' && sessionId && transports.has(sessionId)) {
 					const session = transports.get(sessionId)!;
-					session.lastAccess = Date.now();
-					transport = session.transport;
-				} else {
-					transport = new StreamableHTTPServerTransport({
-						sessionIdGenerator: () => crypto.randomUUID(),
-						onsessioninitialized: newSessionId => {
-							transports.set(newSessionId, { transport, lastAccess: Date.now() });
-						},
-					});
-
-					const server = createMcpServer();
-					await server.connect(transport);
+					await session.transport.close();
+					transports.delete(sessionId);
+					res.status(200).send('Session closed');
+					return;
 				}
 
-				await transport.handleRequest(req, res);
-				return;
-			}
+				if (req.method === 'GET') {
+					// Streamable HTTP transport spec: GET opens an SSE stream on an
+					// already-established session. Without this, MCP clients (like
+					// claude.ai) that open a GET stream after the initial POST will
+					// fail to connect even though OAuth succeeded.
+					if (sessionId && transports.has(sessionId)) {
+						const session = transports.get(sessionId)!;
+						session.lastAccess = Date.now();
+						await session.transport.handleRequest(req, res);
+						return;
+					}
+					process.stderr.write(`[/mcp] GET with missing/unknown session id: ${sessionId}\n`);
+					res.status(400).send('Missing or invalid session ID');
+					return;
+				}
 
-			res.status(405).send('Method not allowed');
+				if (req.method === 'POST') {
+					let transport: StreamableHTTPServerTransport;
+
+					if (sessionId && transports.has(sessionId)) {
+						const session = transports.get(sessionId)!;
+						session.lastAccess = Date.now();
+						transport = session.transport;
+					} else {
+						transport = new StreamableHTTPServerTransport({
+							sessionIdGenerator: () => crypto.randomUUID(),
+							onsessioninitialized: newSessionId => {
+								transports.set(newSessionId, { transport, lastAccess: Date.now() });
+							},
+						});
+
+						const server = createMcpServer();
+						await server.connect(transport);
+					}
+
+					await transport.handleRequest(req, res);
+					return;
+				}
+
+				res.status(405).send('Method not allowed');
+			} catch (err) {
+				const message = err instanceof Error ? err.stack ?? err.message : String(err);
+				process.stderr.write(`[/mcp] Unhandled error (${req.method}): ${message}\n`);
+				if (!res.headersSent) {
+					res.status(500).send('Internal server error');
+				}
+			}
 		});
 
 		app.get('/sse', (_req: Request, res: Response) => {
