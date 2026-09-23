@@ -369,6 +369,7 @@ async function main(): Promise<void> {
 		process.stderr.write('Whoop MCP server running on stdio\n');
 	} else {
 		const app = express();
+		app.set('trust proxy', true);
 		app.use(express.json());
 		app.use(express.urlencoded({ extended: true }));
 
