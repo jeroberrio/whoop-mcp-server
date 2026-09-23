@@ -39,6 +39,34 @@ const sync = new WhoopSync(client, db);
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const transports = new Map<string, { transport: StreamableHTTPServerTransport; lastAccess: number }>();
 
+// OAuth proxy state storage
+interface OAuthSession {
+	clientRedirectUri: string;
+	clientState: string;
+	createdAt: number;
+}
+
+interface OAuthCodeData {
+	accessToken: string;
+	refreshToken: string;
+	expiresAt: number;
+	createdAt: number;
+}
+
+const oauthSessions = new Map<string, OAuthSession>(); // whoopState -> session
+const oauthCodes = new Map<string, OAuthCodeData>(); // code -> token data
+
+// Clean up stale OAuth sessions every 10 minutes
+setInterval(() => {
+	const now = Date.now();
+	for (const [k, v] of oauthSessions) {
+		if (now - v.createdAt > 10 * 60 * 1000) oauthSessions.delete(k);
+	}
+	for (const [k, v] of oauthCodes) {
+		if (now - v.createdAt > 10 * 60 * 1000) oauthCodes.delete(k);
+	}
+}, 10 * 60 * 1000);
+
 function cleanupStaleSessions(): void {
 	const now = Date.now();
 	for (const [sessionId, session] of transports) {
@@ -342,9 +370,101 @@ async function main(): Promise<void> {
 	} else {
 		const app = express();
 		app.use(express.json());
+		app.use(express.urlencoded({ extended: true }));
 
+		// ── OAuth Authorization Server Discovery (RFC 8414) ──────────────────────
+		app.get('/.well-known/oauth-authorization-server', (req: Request, res: Response) => {
+			const baseUrl = `${req.protocol}://${req.headers.host}`;
+			res.json({
+				issuer: baseUrl,
+				authorization_endpoint: `${baseUrl}/authorize`,
+				token_endpoint: `${baseUrl}/token`,
+				response_types_supported: ['code'],
+				grant_types_supported: ['authorization_code'],
+				code_challenge_methods_supported: ['S256', 'plain'],
+				scopes_supported: [
+					'read:profile',
+					'read:body_measurement',
+					'read:cycles',
+					'read:recovery',
+					'read:sleep',
+					'read:workout',
+					'offline',
+				],
+			});
+		});
+
+		// ── OAuth /authorize — proxy to WHOOP ────────────────────────────────────
+		app.get('/authorize', (req: Request, res: Response) => {
+			const {
+				redirect_uri,
+				state,
+			} = req.query as Record<string, string>;
+
+			if (!state || !redirect_uri) {
+				res.status(400).send('Missing required parameters: state, redirect_uri');
+				return;
+			}
+
+			// Generate a unique state to correlate the WHOOP callback
+			const whoopState = crypto.randomUUID();
+
+			oauthSessions.set(whoopState, {
+				clientRedirectUri: redirect_uri,
+				clientState: state,
+				createdAt: Date.now(),
+			});
+
+			// Build WHOOP authorization URL — use our own callback URI
+			const scopes = ['read:profile', 'read:body_measurement', 'read:cycles', 'read:recovery', 'read:sleep', 'read:workout', 'offline'];
+			const whoopAuthUrl = new URL('https://api.prod.whoop.com/oauth/oauth2/auth');
+			whoopAuthUrl.searchParams.set('client_id', config.clientId);
+			whoopAuthUrl.searchParams.set('redirect_uri', config.redirectUri);
+			whoopAuthUrl.searchParams.set('scope', scopes.join(' '));
+			whoopAuthUrl.searchParams.set('response_type', 'code');
+			whoopAuthUrl.searchParams.set('state', whoopState);
+
+			res.redirect(whoopAuthUrl.toString());
+		});
+
+		// ── OAuth /token — issue access token to claude.ai ───────────────────────
+		app.post('/token', (req: Request, res: Response) => {
+			const body = req.body as { code?: string; grant_type?: string };
+			const { code, grant_type } = body;
+
+			if (grant_type !== 'authorization_code') {
+				res.status(400).json({ error: 'unsupported_grant_type' });
+				return;
+			}
+
+			if (!code) {
+				res.status(400).json({ error: 'invalid_request', error_description: 'Missing code' });
+				return;
+			}
+
+			const tokenData = oauthCodes.get(code);
+			if (!tokenData) {
+				res.status(400).json({ error: 'invalid_grant', error_description: 'Invalid or expired authorization code' });
+				return;
+			}
+
+			oauthCodes.delete(code);
+
+			const expiresIn = Math.max(0, Math.floor((tokenData.expiresAt - Date.now()) / 1000));
+
+			res.json({
+				access_token: tokenData.accessToken,
+				token_type: 'Bearer',
+				expires_in: expiresIn,
+				refresh_token: tokenData.refreshToken,
+			});
+		});
+
+		// ── WHOOP OAuth callback ──────────────────────────────────────────────────
 		app.get('/callback', async (req: Request, res: Response) => {
 			const code = req.query.code as string | undefined;
+			const whoopState = req.query.state as string | undefined;
+
 			if (!code) {
 				res.status(400).send('Missing authorization code');
 				return;
@@ -354,9 +474,32 @@ async function main(): Promise<void> {
 				const tokens = await client.exchangeCodeForTokens(code);
 				db.saveTokens(tokens);
 				sync.syncDays(90).catch(() => {});
-				res.send('Authorization successful! You can close this window.');
-			} catch {
-				res.status(500).send('Authorization failed. Please try again.');
+
+				// If this was triggered by claude.ai's OAuth flow, redirect back
+				if (whoopState && oauthSessions.has(whoopState)) {
+					const session = oauthSessions.get(whoopState)!;
+					oauthSessions.delete(whoopState);
+
+					// Mint our own short-lived authorization code for claude.ai
+					const ourCode = crypto.randomUUID();
+					oauthCodes.set(ourCode, {
+						accessToken: tokens.access_token,
+						refreshToken: tokens.refresh_token,
+						expiresAt: tokens.expires_at,
+						createdAt: Date.now(),
+					});
+
+					// Redirect back to claude.ai with the code
+					const redirectUrl = new URL(session.clientRedirectUri);
+					redirectUrl.searchParams.set('code', ourCode);
+					redirectUrl.searchParams.set('state', session.clientState);
+					res.redirect(redirectUrl.toString());
+				} else {
+					res.send('Authorization successful! You can close this window.');
+				}
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				res.status(500).send(`Authorization failed: ${message}`);
 			}
 		});
 
