@@ -564,7 +564,10 @@ async function main(): Promise<void> {
 						await server.connect(transport);
 					}
 
-					await transport.handleRequest(req, res);
+					// Pass the already-parsed body: express.json() has consumed the
+					// raw request stream, so transport.handleRequest(req, res) alone
+					// would try to re-read it and throw "stream is not readable".
+					await transport.handleRequest(req, res, req.body);
 					return;
 				}
 
